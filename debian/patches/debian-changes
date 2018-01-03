@@ -1,0 +1,1571 @@
+Subject: Collected Debian patches for libhybris
+Author: Simon Fels <simon.fels@canonical.com>
+
+The android-tools package is maintained in Git rather than maintaining
+patches as separate files, and separating the patches doesn't seem to
+be worth the effort.  They are therefore all included in this single
+Debian patch.
+
+For full commit history and separated commits, see the packaging Git
+repository.
+--- android-tools-5.1.1r36+git20160322.orig/core/adb/adb.c
++++ android-tools-5.1.1r36+git20160322/core/adb/adb.c
+@@ -36,9 +36,12 @@
+ #if !ADB_HOST
+ #include <cutils/properties.h>
+ #include <private/android_filesystem_config.h>
+-#include <sys/capability.h>
++#include <private/ubuntu_filesystem_config.h>
++#include <pwd.h>
++#include "ubuntu_sockets.h"
++#include <linux/capability.h>
+ #include <sys/mount.h>
+-#include <sys/prctl.h>
++#include <linux/prctl.h>
+ #include <getopt.h>
+ #include <selinux/selinux.h>
+ #else
+@@ -1355,23 +1358,32 @@ int adb_main(int is_daemon, int server_p
+     ** AID_SDCARD_RW to allow writing to the SD card
+     ** AID_NET_BW_STATS to read out qtaguid statistics
+     */
++/*
+     gid_t groups[] = { AID_ADB, AID_LOG, AID_INPUT, AID_INET, AID_GRAPHICS,
+                        AID_NET_BT, AID_NET_BT_ADMIN, AID_SDCARD_R, AID_SDCARD_RW,
+                        AID_NET_BW_STATS };
+     if (setgroups(sizeof(groups)/sizeof(groups[0]), groups) != 0) {
+         exit(1);
+     }
++*/
++    // initialize all default groups for the UBUNTU_PHABLET user
++    struct passwd *pw = getpwuid(UBUNTU_PHABLET);
++    initgroups(pw->pw_name, pw->pw_gid);
+ 
+     /* don't listen on a port (default 5037) if running in secure mode */
+     /* don't run as root if we are running in secure mode */
+     if (should_drop_privileges()) {
+-        drop_capabilities_bounding_set_if_needed();
++        // do not drop capabilities, we are already almost ready, just set CAP_DAC_OVERRIDE
++        // drop_capabilities_bounding_set_if_needed();
++        if (prctl(PR_SET_KEEPCAPS, CAP_DAC_OVERRIDE, 0, 0, 0) != 0) {
++            exit(1);
++        }
+ 
+         /* then switch user and group to "shell" */
+-        if (setgid(AID_SHELL) != 0) {
++        if (setgid(UBUNTU_PHABLET) != 0) {
+             exit(1);
+         }
+-        if (setuid(AID_SHELL) != 0) {
++        if (setuid(UBUNTU_PHABLET) != 0) {
+             exit(1);
+         }
+ 
+@@ -1717,6 +1729,8 @@ int main(int argc, char **argv)
+             break;
+         }
+     }
++    // create adb socket here, usually this is done by Android init
++    ubuntu_create_android_control_socket("adbd", SOCK_STREAM, 0660, UBUNTU_PHABLET, UBUNTU_PHABLET);
+ 
+     start_device_log();
+     D("Handling main()\n");
+--- android-tools-5.1.1r36+git20160322.orig/core/adb/disable_verity_service.c
++++ android-tools-5.1.1r36+git20160322/core/adb/disable_verity_service.c
+@@ -25,12 +25,12 @@
+ #include <fcntl.h>
+ #include <inttypes.h>
+ 
+-#include "cutils/properties.h"
+-#include "ext4_sb.h"
+-#include <fs_mgr.h>
++// #include "cutils/properties.h"
++// #include "ext4_sb.h"
++// #include <fs_mgr.h>
+ 
+-#define FSTAB_PREFIX "/fstab."
+-struct fstab *fstab;
++// #define FSTAB_PREFIX "/fstab."
++// struct fstab *fstab;
+ 
+ __attribute__((__format__(printf, 2, 3))) __nonnull((2))
+ static void write_console(int fd, const char* format, ...)
+@@ -44,107 +44,107 @@ static void write_console(int fd, const
+     adb_write(fd, buffer, strnlen(buffer, sizeof(buffer)));
+ }
+ 
+-static int get_target_device_size(int fd, const char *blk_device,
+-                                  uint64_t *device_size)
+-{
+-    int data_device;
+-    struct ext4_super_block sb;
+-    struct fs_info info;
+-
+-    info.len = 0;  /* Only len is set to 0 to ask the device for real size. */
+-
+-    data_device = adb_open(blk_device, O_RDONLY | O_CLOEXEC);
+-    if (data_device < 0) {
+-        write_console(fd, "Error opening block device (%s)\n", strerror(errno));
+-        return -1;
+-    }
+-
+-    if (lseek64(data_device, 1024, SEEK_SET) < 0) {
+-        write_console(fd, "Error seeking to superblock\n");
+-        adb_close(data_device);
+-        return -1;
+-    }
+-
+-    if (adb_read(data_device, &sb, sizeof(sb)) != sizeof(sb)) {
+-        write_console(fd, "Error reading superblock\n");
+-        adb_close(data_device);
+-        return -1;
+-    }
+-
+-    ext4_parse_sb(&sb, &info);
+-    *device_size = info.len;
+-
+-    adb_close(data_device);
+-    return 0;
+-}
+-
+-static int disable_verity(int fd, const char *block_device,
+-                          const char* mount_point)
+-{
+-    uint32_t magic_number;
+-    const uint32_t voff = VERITY_METADATA_MAGIC_DISABLE;
+-    uint64_t device_length;
+-    int device;
+-    int retval = -1;
+-
+-    device = adb_open(block_device, O_RDWR | O_CLOEXEC);
+-    if (device == -1) {
+-        write_console(fd, "Could not open block device %s (%s).\n",
+-                      block_device, strerror(errno));
+-        write_console(fd, "Maybe run adb remount?\n");
+-        goto errout;
+-    }
+-
+-    // find the start of the verity metadata
+-    if (get_target_device_size(fd, (char*)block_device, &device_length) < 0) {
+-        write_console(fd, "Could not get target device size.\n");
+-        goto errout;
+-    }
+-
+-    if (lseek64(device, device_length, SEEK_SET) < 0) {
+-        write_console(fd,
+-                      "Could not seek to start of verity metadata block.\n");
+-        goto errout;
+-    }
+-
+-    // check the magic number
+-    if (adb_read(device, &magic_number, sizeof(magic_number))
+-             != sizeof(magic_number)) {
+-        write_console(fd, "Couldn't read magic number!\n");
+-        goto errout;
+-    }
+-
+-    if (magic_number == VERITY_METADATA_MAGIC_DISABLE) {
+-        write_console(fd, "Verity already disabled on %s\n", mount_point);
+-        goto errout;
+-    }
+-
+-    if (magic_number != VERITY_METADATA_MAGIC_NUMBER) {
+-        write_console(fd,
+-                      "Couldn't find verity metadata at offset %"PRIu64"!\n",
+-                      device_length);
+-        goto errout;
+-    }
+-
+-    if (lseek64(device, device_length, SEEK_SET) < 0) {
+-        write_console(fd,
+-                      "Could not seek to start of verity metadata block.\n");
+-        goto errout;
+-    }
+-
+-    if (adb_write(device, &voff, sizeof(voff)) != sizeof(voff)) {
+-        write_console(fd, "Could not set verity disabled flag on device %s\n",
+-                      block_device);
+-        goto errout;
+-    }
+-
+-    write_console(fd, "Verity disabled on %s\n", mount_point);
+-    retval = 0;
+-errout:
+-    if (device != -1)
+-        adb_close(device);
+-    return retval;
+-}
++// static int get_target_device_size(int fd, const char *blk_device,
++//                                   uint64_t *device_size)
++// {
++//     int data_device;
++//     struct ext4_super_block sb;
++//     struct fs_info info;
++//
++//     info.len = 0;  /* Only len is set to 0 to ask the device for real size. */
++//
++//     data_device = adb_open(blk_device, O_RDONLY | O_CLOEXEC);
++//     if (data_device < 0) {
++//         write_console(fd, "Error opening block device (%s)\n", strerror(errno));
++//         return -1;
++//     }
++//
++//     if (lseek64(data_device, 1024, SEEK_SET) < 0) {
++//         write_console(fd, "Error seeking to superblock\n");
++//         adb_close(data_device);
++//         return -1;
++//     }
++//
++//     if (adb_read(data_device, &sb, sizeof(sb)) != sizeof(sb)) {
++//         write_console(fd, "Error reading superblock\n");
++//         adb_close(data_device);
++//         return -1;
++//     }
++//
++//     ext4_parse_sb(&sb, &info);
++//     *device_size = info.len;
++//
++//     adb_close(data_device);
++//     return 0;
++// }
++//
++// static int disable_verity(int fd, const char *block_device,
++//                           const char* mount_point)
++// {
++//     uint32_t magic_number;
++//     const uint32_t voff = VERITY_METADATA_MAGIC_DISABLE;
++//     uint64_t device_length;
++//     int device;
++//     int retval = -1;
++//
++//     device = adb_open(block_device, O_RDWR | O_CLOEXEC);
++//     if (device == -1) {
++//         write_console(fd, "Could not open block device %s (%s).\n",
++//                       block_device, strerror(errno));
++//         write_console(fd, "Maybe run adb remount?\n");
++//         goto errout;
++//     }
++//
++//     // find the start of the verity metadata
++//     if (get_target_device_size(fd, (char*)block_device, &device_length) < 0) {
++//         write_console(fd, "Could not get target device size.\n");
++//         goto errout;
++//     }
++//
++//     if (lseek64(device, device_length, SEEK_SET) < 0) {
++//         write_console(fd,
++//                       "Could not seek to start of verity metadata block.\n");
++//         goto errout;
++//     }
++//
++//     // check the magic number
++//     if (adb_read(device, &magic_number, sizeof(magic_number))
++//              != sizeof(magic_number)) {
++//         write_console(fd, "Couldn't read magic number!\n");
++//         goto errout;
++//     }
++//
++//     if (magic_number == VERITY_METADATA_MAGIC_DISABLE) {
++//         write_console(fd, "Verity already disabled on %s\n", mount_point);
++//         goto errout;
++//     }
++//
++//     if (magic_number != VERITY_METADATA_MAGIC_NUMBER) {
++//         write_console(fd,
++//                       "Couldn't find verity metadata at offset %"PRIu64"!\n",
++//                       device_length);
++//         goto errout;
++//     }
++//
++//     if (lseek64(device, device_length, SEEK_SET) < 0) {
++//         write_console(fd,
++//                       "Could not seek to start of verity metadata block.\n");
++//         goto errout;
++//     }
++//
++//     if (adb_write(device, &voff, sizeof(voff)) != sizeof(voff)) {
++//         write_console(fd, "Could not set verity disabled flag on device %s\n",
++//                       block_device);
++//         goto errout;
++//     }
++//
++//     write_console(fd, "Verity disabled on %s\n", mount_point);
++//     retval = 0;
++// errout:
++//     if (device != -1)
++//         adb_close(device);
++//     return retval;
++// }
+ 
+ void disable_verity_service(int fd, void* cookie)
+ {
+@@ -191,7 +191,8 @@ void disable_verity_service(int fd, void
+                       "Now reboot your device for settings to take effect\n");
+     }
+ #else
+-    write_console(fd, "disable-verity only works for userdebug builds\n");
++//    write_console(fd, "disable-verity only works for userdebug builds\n");
++    write_console(fd, "disable-verity is not supported by Ubuntu touch\n");
+ #endif
+ 
+ errout:
+--- android-tools-5.1.1r36+git20160322.orig/core/adb/remount_service.c
++++ android-tools-5.1.1r36+git20160322/core/adb/remount_service.c
+@@ -57,12 +57,13 @@ static char *find_mount(const char *dir)
+         char mount_dir[256];
+         int mount_freq;
+         int mount_passno;
++        struct stat st;
+ 
+         res = sscanf(token, "%255s %255s %*s %*s %d %d\n",
+                      mount_dev, mount_dir, &mount_freq, &mount_passno);
+         mount_dev[255] = 0;
+         mount_dir[255] = 0;
+-        if (res == 4 && (strcmp(dir, mount_dir) == 0))
++        if (res == 4 && (strcmp(dir, mount_dir) == 0) && (stat(mount_dev, &st) == 0))
+             return strdup(mount_dev);
+ 
+         token = strtok(NULL, delims);
+@@ -147,8 +148,8 @@ void remount_service(int fd, void *cooki
+         write_string(fd, buffer);
+     }
+ 
+-    if (remount("/system", &system_ro)) {
+-        snprintf(buffer, sizeof(buffer), "remount of system failed: %s\n",strerror(errno));
++    if (remount("/", &system_ro)) {
++        snprintf(buffer, sizeof(buffer), "remount of rootfs failed: %s\n",strerror(errno));
+         write_string(fd, buffer);
+     }
+ 
+--- android-tools-5.1.1r36+git20160322.orig/core/adb/services.c
++++ android-tools-5.1.1r36+git20160322/core/adb/services.c
+@@ -20,6 +20,7 @@
+ #include <unistd.h>
+ #include <string.h>
+ #include <errno.h>
++#include <pwd.h>
+ 
+ #include "sysdeps.h"
+ 
+@@ -199,11 +200,11 @@ static void init_subproc_child()
+     }
+ }
+ 
+-static int create_subproc_pty(const char *cmd, const char *arg0, const char *arg1, pid_t *pid)
++static int create_subproc_pty(const char *cmd, const char *arg0, const char *arg1, const char *arg2, const char *arg3,  const char *arg4, pid_t *pid)
+ {
+-    D("create_subproc_pty(cmd=%s, arg0=%s, arg1=%s)\n", cmd, arg0, arg1);
++    D("create_subproc_pty(cmd=%s, arg0=%s, arg1=%s, arg2=%s, arg3=%s, arg4=%s)\n", cmd, arg0, arg1, arg2, arg3, arg4);
+ #ifdef HAVE_WIN32_PROC
+-    fprintf(stderr, "error: create_subproc_pty not implemented on Win32 (%s %s %s)\n", cmd, arg0, arg1);
++    fprintf(stderr, "error: create_subproc_pty not implemented on Win32 (%s %s %s %s %s %s)\n", cmd, arg0, arg1, arg2, arg3, arg4);
+     return -1;
+ #else /* !HAVE_WIN32_PROC */
+     int ptm;
+@@ -244,7 +245,7 @@ static int create_subproc_pty(const char
+         adb_close(pts);
+         adb_close(ptm);
+ 
+-        execl(cmd, cmd, arg0, arg1, NULL);
++        execl(cmd, cmd, arg0, arg1, arg2, arg3, arg4, NULL);
+         fprintf(stderr, "- exec '%s' failed: %s (%d) -\n",
+                 cmd, strerror(errno), errno);
+         exit(-1);
+@@ -254,11 +255,11 @@ static int create_subproc_pty(const char
+ #endif /* !HAVE_WIN32_PROC */
+ }
+ 
+-static int create_subproc_raw(const char *cmd, const char *arg0, const char *arg1, pid_t *pid)
++static int create_subproc_raw(const char *cmd, const char *arg0, const char *arg1, const char *arg2, const char *arg3,  const char *arg4, pid_t *pid)
+ {
+-    D("create_subproc_raw(cmd=%s, arg0=%s, arg1=%s)\n", cmd, arg0, arg1);
++    D("create_subproc_raw(cmd=%s, arg0=%s, arg1=%s, arg2=%s, arg3=%s, arg4=%s)\n", cmd, arg0, arg1, arg2, arg3, arg4);
+ #ifdef HAVE_WIN32_PROC
+-    fprintf(stderr, "error: create_subproc_raw not implemented on Win32 (%s %s %s)\n", cmd, arg0, arg1);
++    fprintf(stderr, "error: create_subproc_raw not implemented on Win32 (%s %s %s %s %s %s)\n", cmd, arg0, arg1, arg2, arg3, arg4);
+     return -1;
+ #else /* !HAVE_WIN32_PROC */
+ 
+@@ -287,7 +288,7 @@ static int create_subproc_raw(const char
+ 
+         adb_close(sv[1]);
+ 
+-        execl(cmd, cmd, arg0, arg1, NULL);
++        execl(cmd, cmd, arg0, arg1, arg2, arg3, arg4, NULL);
+         fprintf(stderr, "- exec '%s' failed: %s (%d) -\n",
+                 cmd, strerror(errno), errno);
+         exit(-1);
+@@ -301,9 +302,12 @@ static int create_subproc_raw(const char
+ 
+ #if ADB_HOST
+ #define SHELL_COMMAND "/bin/sh"
++#define ALTERNATE_SHELL_COMMAND ""
+ #else
+ #define SHELL_COMMAND "/system/bin/sh"
++#define ALTERNATE_SHELL_COMMAND "/sbin/sh"
+ #endif
++#define SUDO "/usr/bin/sudo"
+ 
+ #if !ADB_HOST
+ static void subproc_waiter_service(int fd, void *cookie)
+@@ -344,19 +348,47 @@ static int create_subproc_thread(const c
+     int ret_fd;
+     pid_t pid = -1;
+ 
+-    const char *arg0, *arg1;
++    const char* shell_command;
++    struct stat st;
++
++    struct passwd *user = (struct passwd *)getpwuid(getuid());
++    char useropt[256] = "-u";
++    char arg0 [10] = "-";
++    const char *arg1;
+     if (name == 0 || *name == 0) {
+-        arg0 = "-"; arg1 = 0;
++        arg1 = 0;
+     } else {
+-        arg0 = "-c"; arg1 = name;
++        strcat(arg0, "c"); arg1 = name;
++    }
++
++    char value[PROPERTY_VALUE_MAX];
++    property_get("persist.sys.adb.shell", value, "");
++    if (user && user->pw_shell && user->pw_name) {
++        shell_command = user->pw_shell;
++        strcat(arg0, "l");
++        if (user->pw_name)
++            strcat(useropt, user->pw_name);
++
++        if (user->pw_dir)
++            if(chdir(user->pw_dir) < 0 )
++                return 1;
++
++    } else if (value[0] != '\0' && stat(value, &st) == 0) {
++        shell_command = value;
++    }
++    else if (stat(ALTERNATE_SHELL_COMMAND, &st) == 0) {
++        shell_command = ALTERNATE_SHELL_COMMAND;
++    }
++    else {
++        shell_command = SHELL_COMMAND;
+     }
+ 
+     switch (mode) {
+     case SUBPROC_PTY:
+-        ret_fd = create_subproc_pty(SHELL_COMMAND, arg0, arg1, &pid);
++        ret_fd = create_subproc_pty(SUDO, useropt, "-i", shell_command, arg0, arg1, &pid);
+         break;
+     case SUBPROC_RAW:
+-        ret_fd = create_subproc_raw(SHELL_COMMAND, arg0, arg1, &pid);
++        ret_fd = create_subproc_raw(SUDO, useropt, "-i", shell_command, arg0, arg1, &pid);
+         break;
+     default:
+         fprintf(stderr, "invalid subproc_mode %d\n", mode);
+--- android-tools-5.1.1r36+git20160322.orig/core/adb/usb_vendors.c
++++ android-tools-5.1.1r36+git20160322/core/adb/usb_vendors.c
+@@ -51,6 +51,8 @@
+ #define VENDOR_ID_ARCHOS        0x0E79
+ // Asus's USB Vendor ID
+ #define VENDOR_ID_ASUS          0x0b05
++// BQ's USB Vendor ID
++#define VENDOR_ID_BQ            0x2a47
+ // BYD's USB Vendor ID
+ #define VENDOR_ID_BYD           0x1D91
+ // Compal's USB Vendor ID
+@@ -121,6 +123,8 @@
+ #define VENDOR_ID_LGE           0x1004
+ // Lumigon's USB Vendor ID
+ #define VENDOR_ID_LUMIGON       0x25E3
++// Meizu's USB Vendor ID
++#define VENDOR_ID_MEIZU         0x2a45
+ // Motorola's USB Vendor ID
+ #define VENDOR_ID_MOTOROLA      0x22b8
+ // MSI's USB Vendor ID
+@@ -206,6 +210,7 @@ int builtInVendorIds[] = {
+     VENDOR_ID_ANYDATA,
+     VENDOR_ID_ARCHOS,
+     VENDOR_ID_ASUS,
++    VENDOR_ID_BQ,
+     VENDOR_ID_BYD,
+     VENDOR_ID_COMPAL,
+     VENDOR_ID_COMPALCOMM,
+@@ -241,6 +246,7 @@ int builtInVendorIds[] = {
+     VENDOR_ID_LENOVOMOBILE,
+     VENDOR_ID_LGE,
+     VENDOR_ID_LUMIGON,
++    VENDOR_ID_MEIZU,
+     VENDOR_ID_MOTOROLA,
+     VENDOR_ID_MSI,
+     VENDOR_ID_MTK,
+--- android-tools-5.1.1r36+git20160322.orig/core/include/cutils/properties.h
++++ android-tools-5.1.1r36+git20160322/core/include/cutils/properties.h
+@@ -19,7 +19,7 @@
+ 
+ #include <sys/cdefs.h>
+ #include <stddef.h>
+-#include <sys/system_properties.h>
++#include <hybris/properties/properties.h>
+ #include <stdint.h>
+ 
+ #ifdef __cplusplus
+--- android-tools-5.1.1r36+git20160322.orig/core/include/log/log.h
++++ android-tools-5.1.1r36+git20160322/core/include/log/log.h
+@@ -37,7 +37,8 @@
+ #include <time.h>
+ #include <unistd.h>
+ #include <log/logd.h>
+-#include <log/uio.h>
++// Removing include, already defined from /usr/include/
++// #include <log/uio.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+--- android-tools-5.1.1r36+git20160322.orig/core/include/log/logd.h
++++ android-tools-5.1.1r36+git20160322/core/include/log/logd.h
+@@ -31,7 +31,8 @@
+ #ifdef HAVE_PTHREADS
+ #include <pthread.h>
+ #endif
+-#include <log/uio.h>
++// Removing include, already defined from /usr/include/
++// #include <log/uio.h>
+ #include <stdarg.h>
+ 
+ #ifdef __cplusplus
+--- android-tools-5.1.1r36+git20160322.orig/core/include/private/android_filesystem_capability.h
++++ android-tools-5.1.1r36+git20160322/core/include/private/android_filesystem_capability.h
+@@ -22,6 +22,7 @@
+ #define _SYSTEM_CORE_INCLUDE_PRIVATE_ANDROID_FILESYSTEM_CAPABILITY_H
+ 
+ #include <stdint.h>
++#include <linux/capability.h>
+ 
+ #define __user
+ #define __u32 uint32_t
+@@ -34,17 +35,6 @@
+ #define _LINUX_CAPABILITY_VERSION_3 0x20080522
+ #define _LINUX_CAPABILITY_U32S_3 2
+ 
+-typedef struct __user_cap_header_struct {
+- __u32 version;
+- int pid;
+-} __user *cap_user_header_t;
+-
+-typedef struct __user_cap_data_struct {
+- __u32 effective;
+- __u32 permitted;
+- __u32 inheritable;
+-} __user *cap_user_data_t;
+-
+ #define VFS_CAP_REVISION_MASK 0xFF000000
+ #define VFS_CAP_REVISION_SHIFT 24
+ #define VFS_CAP_FLAGS_MASK ~VFS_CAP_REVISION_MASK
+@@ -59,14 +49,6 @@ typedef struct __user_cap_data_struct {
+ #define VFS_CAP_U32 VFS_CAP_U32_2
+ #define VFS_CAP_REVISION VFS_CAP_REVISION_2
+ 
+-struct vfs_cap_data {
+- __le32 magic_etc;
+- struct {
+- __le32 permitted;
+- __le32 inheritable;
+- } data[VFS_CAP_U32];
+-};
+-
+ #define _LINUX_CAPABILITY_VERSION _LINUX_CAPABILITY_VERSION_1
+ #define _LINUX_CAPABILITY_U32S _LINUX_CAPABILITY_U32S_1
+ #define CAP_CHOWN 0
+--- android-tools-5.1.1r36+git20160322.orig/core/include/private/android_filesystem_config.h
++++ android-tools-5.1.1r36+git20160322/core/include/private/android_filesystem_config.h
+@@ -213,6 +213,7 @@ static const struct fs_path_config andro
+     { 00755, AID_ROOT,   AID_ROOT,   0, "system/etc/ppp" },
+     { 00755, AID_ROOT,   AID_SHELL,  0, "vendor" },
+     { 00777, AID_ROOT,   AID_ROOT,   0, "sdcard" },
++    { 00755, AID_ROOT,   AID_ROOT,   0, "system/ubuntu*" },
+     { 00755, AID_ROOT,   AID_ROOT,   0, 0 },
+ };
+ 
+@@ -266,6 +267,9 @@ static const struct fs_path_config andro
+     { 00750, AID_ROOT,      AID_SHELL,     0, "init*" },
+     { 00750, AID_ROOT,      AID_SHELL,     0, "sbin/fs_mgr" },
+     { 00640, AID_ROOT,      AID_SHELL,     0, "fstab.*" },
++    { 00644, AID_ROOT,      AID_ROOT,      0, "system/ubuntu/usr/etc/*" },
++    { 00755, AID_ROOT,      AID_ROOT,      0, "system/ubuntu/usr/bin/*" },
++    { 00644, AID_ROOT,      AID_ROOT,      0, "system/ubuntu/usr/lib/*" },
+     { 00644, AID_ROOT,      AID_ROOT,      0, 0 },
+ };
+ 
+@@ -297,7 +301,12 @@ static inline void fs_config(const char
+     }
+     *uid = pc->uid;
+     *gid = pc->gid;
+-    *mode = (*mode & (~07777)) | pc->mode;
++    if(!strncmp("system/ubuntu/", path, 14)) {
++        // this is ubuntu overlay, merge with existing host os file permissions
++        *mode = (*mode & (~07000)) | pc->mode;
++    } else {
++        *mode = (*mode & (~07777)) | pc->mode;
++    }
+     *capabilities = pc->capabilities;
+ 
+ #if 0
+--- /dev/null
++++ android-tools-5.1.1r36+git20160322/core/include/private/ubuntu_filesystem_config.h
+@@ -0,0 +1,485 @@
++/*
++ * Copyright 2014 Canonical Ltd.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* This file is used to define the properties of the filesystem
++** images generated by build tools (mkbootfs and mkyaffs2image) and
++** by the device side of adb.
++*/
++
++#ifndef _UBUNTU_FILESYSTEM_CONFIG_H_
++#define _UBUNTU_FILESYSTEM_CONFIG_H_
++
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <stdint.h>
++
++
++/* This is the master Users and Groups config for the platform.
++ * DO NOT EVER RENUMBER
++ */
++
++#define UBUNTU_ID_ROOT             0  /* traditional unix root user */
++#define UBUNTU_PHABLET         32011  /* Ubuntu phone phablet user */
++
++#define U_CLICKPKG_UID           103
++#define U_CLICKPKG_GID           107
++
++#define U_LIGHTDM_UID            108
++#define U_LIGHTDM_GID            111
++
++#define U_MESSAGEBUS_U           102
++#define U_MESSAGEBUS_G           106
++#define U_UBUNTU_TMP_G            43
++
++#define U_WHOOPSIE_G             110
++
++#define U_USERMETRICS_U          101
++#define U_USERMETRICS_G          104
++
++#define U_STAFF_GID               50
++#define U_SYSLOG_GID             103
++#define U_MAIL_GID                 8
++#define U_CRONTAB_GID            102
++
++#define U_SYSLOG_UID             100
++#define U_ADM_GID                  4
++
++#define U_LIBUUID_GID            101
++
++#define U_DNSMASQ_UID            104
++#define U_NOGROUP_GID            65534
++
++#define U_SHADOW_GID              42
++#define U_SSH_GID                108
++#define U_TTY_GID                  5
++
++typedef struct ubuntu_fs_path_config {
++    unsigned mode;
++    unsigned uid;
++    unsigned gid;
++    uint64_t capabilities;
++    const char *prefix;
++} ubuntu_fs_path_config;
++
++static struct ubuntu_fs_path_config* ubuntu_files_c;
++static struct ubuntu_fs_path_config* ubuntu_dirs_c;
++
++/* Rules for directories.
++** These rules are applied based on "first match", so they
++** should start with the most specific path and work their
++** way up to the root. Prefixes ending in * denotes wildcard
++** and will allow partial matches.
++*/
++
++static const struct ubuntu_fs_path_config ubuntu_dirs[] = {
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "android" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "bin" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "boot" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "dev" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "etc" },
++    { 00700, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "etc/polkit-1/localauthority" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "etc/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "home" },
++    { 00755, UBUNTU_PHABLET,   UBUNTU_PHABLET,  0, "home/phablet" },
++    { 00755, UBUNTU_PHABLET,   UBUNTU_PHABLET,  0, "home/phablet/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "lib" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "lib/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "media" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "mnt" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "opt" },
++    { 00755, U_CLICKPKG_UID,   U_CLICKPKG_GID,  0, "opt/click.ubuntu.com" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "proc" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "root" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "run" },
++    { 00755, U_MESSAGEBUS_U,   U_MESSAGEBUS_G,  0, "run/dbus" },
++    { 00755, U_DNSMASQ_UID,    U_NOGROUP_GID,   0, "run/dnsmasq" },
++    { 00755, UBUNTU_ID_ROOT,   U_LIBUUID_GID,   0, "run/network" },
++    { 01777, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "run/lock" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "run/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "sbin" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "srv" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "sys" },
++    { 01777, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "tmp" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "usr" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "usr/local/lib/python3.4" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "usr/local/lib/python3.4/dist-packages" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "usr/local/share/ca-certificates" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "usr/local/share/emacs" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "usr/local/share/emacs/site-lisp" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "usr/local/share/fonts" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "usr/share/click/preinstalled/.click/users/@all" },
++    { 00755, U_CLICKPKG_UID,   U_CLICKPKG_GID,  0, "usr/share/click/preinstalled" },
++    { 00755, U_CLICKPKG_UID,   U_CLICKPKG_GID,  0, "usr/share/click/preinstalled/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "usr/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "var" },
++    { 03777, UBUNTU_ID_ROOT,   U_WHOOPSIE_G,    0, "var/crash" },
++    { 00750, U_LIGHTDM_UID,    U_LIGHTDM_GID,   0, "var/lib/lightdm" },
++    { 02775, UBUNTU_ID_ROOT,   U_STAFF_GID,     0, "var/local" },
++    { 00775, UBUNTU_ID_ROOT,   U_SYSLOG_GID,    0, "var/log" },
++    { 02775, UBUNTU_ID_ROOT,   U_MAIL_GID,      0, "var/mail" },
++    { 03777, UBUNTU_ID_ROOT,   U_WHOOPSIE_G,    0, "var/metrics" },
++    { 01777, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "var/tmp" },
++    { 02770, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "var/lib/system-image" },
++    { 02775, U_LIGHTDM_UID,    U_LIGHTDM_GID,   0, "var/lib/libuuid" },
++    { 00750, U_USERMETRICS_U,  U_USERMETRICS_G, 0, "var/lib/usermetrics" },
++    { 01730, UBUNTU_ID_ROOT,   U_CRONTAB_GID,   0, "var/spool/cron/crontabs" },
++    { 00700, U_SYSLOG_UID,     U_ADM_GID,       0, "var/spool/rsyslog" },
++    { 02770, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "var/log/system-image" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "var/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "userdata" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "custom" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, "custom/*" },
++    { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, 0 },
++};
++
++/* Rules for files.
++** These rules are applied based on "first match", so they
++** should start with the most specific path and work their
++** way up to the root. Prefixes ending in * denotes wildcard
++** and will allow partial matches.
++*/
++static const struct ubuntu_fs_path_config ubuntu_files[] = {
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "bin/ping" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "bin/umount" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "bin/ping6" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "bin/mount" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "bin/su" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "bin/*" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/lightdm-guest-session" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/lightdm-guest-session" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/lxc-containers" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/sbin.dhclient" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/usr.bin.lxc-start" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/usr.bin.media-hub-server" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/usr.bin.mediascanner-service-2.0" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apparmor.d/cache/usr.lib.telepathy" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/apm/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/init.d/README" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/init.d/skeleton" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/init.d/.*" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/init.d/*" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/initramfs/post-update.d/zz-flash-touch-initrd" },
++    { 00440, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/sudoers.d/README" },
++    { 00440, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/sudoers" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/security/opasswd" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/cron.daily/logrotate" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/cron.daily/upstart" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/cron.daily/dpkg" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/cron.daily/passwd" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/cron.daily/apport" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/cron.daily/apt" },
++    { 00640, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "etc/gshadow" },
++    { 00640, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "etc/shadow" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/gtk-3.0/settings.ini" },
++    { 00600, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/security/opasswd" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/wpa_supplicant/*" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/security/namespace.init" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/network/if-pre-up.d/*" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/network/if-post-down.d/*" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/network/if-down.d/*" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/network/if-up.d/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "etc/*" },
++    { 00644, UBUNTU_PHABLET,      UBUNTU_PHABLET,      0, "home/phablet/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "lib/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "root/*" },
++    { 00644, UBUNTU_ID_ROOT,      U_UBUNTU_TMP_G,      0, "run/utmp" },
++    { 00444, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "run/resolvconf/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "run/*" },
++    { 02755, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "sbin/pam_extrausers_chkpwd" },
++    { 02755, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "sbin/unix_chkpwd" },
++    { 00755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "sbin/*" },
++    { 02755, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "usr/bin/chage" },
++    { 02755, UBUNTU_ID_ROOT,      U_CRONTAB_GID,       0, "usr/bin/crontab" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/chfn" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/chsh" },
++    { 02755, UBUNTU_ID_ROOT,      U_MAIL_GID,          0, "usr/bin/dotlockfile" },
++    { 02755, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "usr/bin/expiry" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/gpasswd" },
++    { 02755, UBUNTU_ID_ROOT,      U_MAIL_GID,          0, "usr/bin/mail-lock" },
++    { 02755, UBUNTU_ID_ROOT,      U_MAIL_GID,          0, "usr/bin/mail-touchlock" },
++    { 02755, UBUNTU_ID_ROOT,      U_MAIL_GID,          0, "usr/bin/mail-unlock" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/newgrp" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/passwd" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/pkexec" },
++    { 02755, UBUNTU_ID_ROOT,      U_SSH_GID,           0, "usr/bin/ssh-agent" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/sudo" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/bin/tcptraceroute.mt" },
++    { 02755, UBUNTU_ID_ROOT,      U_TTY_GID,           0, "usr/bin/wall" },
++    { 02755, UBUNTU_ID_ROOT,      U_TTY_GID,           0, "usr/bin/*" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/lib/arm-linux-gnueabihf/lxc/lxc-user-nic" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/lib/arm-linux-gnueabihf/oxide-qt/chrome-sandbox" },
++    { 04754, UBUNTU_ID_ROOT,      U_MESSAGEBUS_G,      0, "usr/lib/dbus-1.0/dbus-daemon-launch-helper" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/lib/eject/dmcrypt-get-device" },
++    { 02755, UBUNTU_ID_ROOT,      U_MAIL_GID,          0, "usr/lib/evolution/camel-lock-helper-1.2" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/lib/openssh/ssh-keysign" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/lib/policykit-1/polkit-agent-helper-1" },
++    { 04755, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/lib/pt_chown" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/share/click/preinstalled/.click/users/@all/*" },
++    { 00644, U_CLICKPKG_UID,      U_CLICKPKG_GID,      0, "usr/share/click/preinstalled/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "usr/*" },
++    { 00640, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "var/cache/apt/archives/lock" },
++    { 00640, UBUNTU_ID_ROOT,      U_SHADOW_GID,        0, "var/lib/extrausers/shadow" },
++    { 00664, UBUNTU_ID_ROOT,      U_UBUNTU_TMP_G,      0, "var/log/btmp" },
++    { 00640, UBUNTU_ID_ROOT,      U_ADM_GID,           0, "var/log/dmesg" },
++    { 00640, UBUNTU_ID_ROOT,      U_ADM_GID,           0, "var/log/fsck/checkfs" },
++    { 00640, UBUNTU_ID_ROOT,      U_ADM_GID,           0, "var/log/fsck/checkroot" },
++    { 00664, UBUNTU_ID_ROOT,      U_UBUNTU_TMP_G,      0, "var/log/lastlog" },
++    { 00664, UBUNTU_ID_ROOT,      U_UBUNTU_TMP_G,      0, "var/log/wtmp" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "var/*" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "cache" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "data" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "factory" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "firmware" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "persist" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "system" },
++    { 00777, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "vendor" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "custom/build_id" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, "custom/*" },
++    { 00644, UBUNTU_ID_ROOT,      UBUNTU_ID_ROOT,      0, 0 },
++};
++
++
++static inline void ubuntu_set_fs_content(const char *fs_content) {
++    // lrwxrwxrwx 0/0               0 2014-05-21 16:15 system/bin/ypdomainname -> hostname
++    // first letter is type
++        // Socket            's' : 0xC000
++        // Symbolic Link     'l' : 0xA000
++        // Regular           '-' : 0x8000
++        // Block special     'b' : 0x6000
++        // Directory         'd' : 0x4000
++        // Character special 'c' : 0x2000
++        // FIFO pipe         'p' : 0x1000
++
++   // Owner
++        // 'r' : 0x0100
++        // 'w' : 0x0080
++        // 'x' : 0x0040
++        // 's' : 0x0040 | 0x0800
++        // 'S' : 0x0800
++
++    // Group
++        // 'r' : 0x0020
++        // 'w' : 0x0010
++        // 'x' : 0x0008
++        // 's' : 0x0008 | 0x0400
++        // 'S' : 0x0400
++
++    // Others
++        // 'r' : 0x0004
++        // 'w' : 0x0002
++        // 'x' : 0x0001
++        // 't' : 0x0001 | 0x0200
++        // 'T' : 0x0200
++    FILE* file = NULL;
++    file = fopen(fs_content, "r");
++    if (NULL != file) {
++        char line[512];
++        char number[10];
++        int fileNum = 0;
++        int dirNum = 0;
++        unsigned numberOfFiles = 0;
++        unsigned numberOfDirs = 0;
++        int fd = fileno(file);
++
++        // first count numner of files and dirs and allocate needed arrays
++        while (fgets(line, sizeof(line), file)) {
++            switch (line[0]) {
++                case 'd': numberOfDirs++; break;
++                default: numberOfFiles++;
++            }
++        }
++        printf("fs contains %lu directories and %lu files\n", numberOfDirs, numberOfFiles);
++        // we do memory allocation, but we don't get signal when to free memory, instead we have to rely on process running exiting once task is done
++        // at the same time, rules are needed while tool is running, so no harm done.
++        ubuntu_files_c = (struct ubuntu_fs_path_config*) malloc(sizeof(ubuntu_files) * numberOfFiles + 1);
++        ubuntu_dirs_c  = (struct ubuntu_fs_path_config*) malloc(sizeof(ubuntu_files) * numberOfDirs + 1);
++        rewind(file);
++        while (fgets(line, sizeof(line), file)) {
++            unsigned mode = 0;
++            unsigned owner = 0;
++            unsigned group = 0;
++            int index, size;
++            char* parsed = NULL;
++            // ignore type for now
++            // owner
++            if ( line[1] == 'r') mode|= 0x0100;
++            if ( line[2] == 'w') mode|= 0x0080;
++            switch (line[3]) {
++                case 'x' : mode|= 0x0040; break;
++                case 's' : mode|= 0x0840; break;
++                case 'S' : mode|= 0x0800; break;
++            }
++            // group
++            if ( line[4] == 'r') mode|= 0x0020;
++            if ( line[5] == 'w') mode|= 0x0010;
++            switch (line[6]) {
++                case 'x' : mode|= 0x0008; break;
++                case 's' : mode|= 0x0408; break;
++                case 'S' : mode|= 0x0400; break;
++            }
++            // Others
++            if ( line[7] == 'r') mode|= 0x0004;
++            if ( line[8] == 'w') mode|= 0x0002;
++
++            switch (line[9]) {
++                case 'x' : mode|= 0x0001; break;
++                case 't' : mode|= 0x0201; break;
++                case 'T' : mode|= 0x0200; break;
++            }
++            // OWNER_ID/GROUP_ID
++            parsed = strchr(&line[10], '/');
++            if (parsed == NULL){
++                printf("Failed to parse line: %s", line);
++                continue;
++            }
++            memset(number, 0, sizeof(number));
++            strncpy(number, &line[11], parsed - &line[11]);
++            owner = atoi(number);
++            char* space = strchr(parsed, ' ');
++            if (space == NULL){
++                printf("Failed to parse line: %s", line);
++                continue;
++            }
++            memset(number, 0, sizeof(number));
++            strncpy(number, ++parsed, space - parsed);
++            group = atoi(number);
++
++            // parse file/dir name
++            char* fileName = strstr(parsed, " system/");
++            if (fileName == NULL){
++                printf("Failed to parse line: %s", line);
++                continue;
++            }
++            fileName+=8;
++            // if file is link, remove "->" part
++            if (line[0] == 'l') {
++                parsed =  strstr(fileName, " ->");
++                if (parsed != NULL) {
++                    size = parsed - fileName;
++                } else {
++                    printf("Failed to parse line:%s\n", line);
++                    continue;
++                }
++            } else if (line[0] == 'h') {
++                parsed =  strstr(fileName, " link to ");
++                if (parsed != NULL) {
++                   size = parsed - fileName;
++                } else {
++                    printf("Failed to parse line:%s\n", line);
++                    continue;
++                }
++            } else {
++                parsed = strchr(fileName, '\n');
++                // if last characted is "/" remove it
++                if ( parsed == NULL) {
++                    printf("Failed to parse content file: does content file end with empty line?");
++                    return;
++                }
++                if  (*(parsed -1) == '/') {
++                   --parsed;
++                }
++                size = parsed - fileName;
++            }
++            // same thing applies here and array mem allocation
++            char* fileNamebuf = malloc(sizeof(char) * (size +1));
++            strncpy(fileNamebuf, fileName, size);
++            // add entry to the compare tables
++            ubuntu_fs_path_config entry = { mode, owner, group, 0, fileNamebuf };
++             if (line[0] == 'd') {
++                 ubuntu_dirs_c[dirNum++]=entry;
++                 // printf("dir:%04o--%d/%d--%d-:%s\n",  mode, owner, group, size, fileNamebuf);
++             } else {
++                 ubuntu_files_c[fileNum++]= entry;
++                 // printf("file:%04o--%d/%d--%d-:%s\n",  mode, owner, group, size, fileNamebuf);
++             }
++             memset(line, 0, sizeof(line));
++        }
++        fclose(file);
++        ubuntu_fs_path_config lastDir = { 00755, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, 0 };
++        ubuntu_dirs_c[dirNum]=lastDir;
++        ubuntu_fs_path_config lastFile = { 00644, UBUNTU_ID_ROOT,   UBUNTU_ID_ROOT,  0, 0 };
++        ubuntu_files_c[fileNum]= lastFile;
++    }
++}
++
++static inline const struct fs_path_config* findConfig(const char *path, const struct fs_path_config* pc) {
++    int plen = strlen(path);
++    for(; pc->prefix; pc++){
++        int len = strlen(pc->prefix);
++        // user same patern matching for files and directories
++        if (pc->prefix[len -1] == '*') {
++            if(!strncmp(pc->prefix, path, len - 1)) break;
++        } else if (plen == len){
++            if(!strncmp(pc->prefix, path, len)) break;
++        } else {
++        }
++    }
++    return pc;
++}
++
++static inline void ubuntu_fs_config(const char *path, int dir,
++                             unsigned *uid, unsigned *gid, unsigned *mode, uint64_t *capabilities)
++{
++    const struct fs_path_config *pc;
++    int cfr;
++
++    if (path[0] == '/') {
++        path++;
++    }
++    // if there are content array used those instead
++    if (dir) {
++        pc = ubuntu_dirs_c ? ubuntu_dirs_c : ubuntu_dirs;
++    } else {
++        pc = ubuntu_files_c ? ubuntu_files_c : ubuntu_files;
++    }
++    pc = findConfig( path, pc);
++    cfr = (dir && ubuntu_dirs_c || ubuntu_files_c);
++    if ( 0 == pc->prefix ) {
++        if (cfr) {
++            cfr = 0;
++            // check if we have rule in default set
++            if (dir) {
++                pc = ubuntu_dirs;
++            } else {
++                pc = ubuntu_files;
++            }
++            pc = findConfig( path, pc);
++            if ( 0 == pc->prefix ) {
++                printf("Permission rule not found for %s:%s\n", dir ? "dir": "file", path);
++            } else {
++                printf("Using permission rule from default set for %s:%s\n", dir ? "dir": "file", path);
++            }
++        } else {
++            printf("Permission rule not found for %s:%s\n", dir ? "dir": "file", path);
++        }
++    }
++    *uid = pc->uid;
++    *gid = pc->gid;
++    // if permissions are comming from content file use those, if permissions are from default set
++    // then use those from host filesystem itself since prebuild files are unpacked from tar,
++    // permissions should be mostly right correct only permissions which are in 4th octet
++    if (cfr) {
++        *mode = pc->mode;
++    } else {
++        if (pc->mode & 07000) {
++            *mode = (*mode & (~07000)) | pc->mode;
++        }
++    }
++    *capabilities = pc->capabilities;
++}
++
++#endif
+--- android-tools-5.1.1r36+git20160322.orig/core/liblog/fake_log_device.c
++++ android-tools-5.1.1r36+git20160322/core/liblog/fake_log_device.c
+@@ -182,7 +182,7 @@ static void deleteFakeFd(int fd)
+  */
+ static void configureInitialState(const char* pathName, LogState* logState)
+ {
+-    static const int kDevLogLen = sizeof("/dev/log/") - 1;
++    static const int kDevLogLen = sizeof("/dev/alog/") - 1;
+ 
+     logState->debugName = strdup(pathName);
+ 
+--- android-tools-5.1.1r36+git20160322.orig/core/liblog/log_read_kern.c
++++ android-tools-5.1.1r36+git20160322/core/liblog/log_read_kern.c
+@@ -41,7 +41,7 @@ typedef char bool;
+ #define false (const bool)0
+ #define true (const bool)1
+ 
+-#define LOG_FILE_DIR "/dev/log/"
++#define LOG_FILE_DIR "/dev/alog/"
+ 
+ /* timeout in milliseconds */
+ #define LOG_TIMEOUT_FLUSH 5
+--- android-tools-5.1.1r36+git20160322.orig/core/liblog/logd_write_kern.c
++++ android-tools-5.1.1r36+git20160322/core/liblog/logd_write_kern.c
+@@ -36,10 +36,10 @@
+ #include <log/logd.h>
+ #include <log/logger.h>
+ 
+-#define LOGGER_LOG_MAIN		"log/main"
+-#define LOGGER_LOG_RADIO	"log/radio"
+-#define LOGGER_LOG_EVENTS	"log/events"
+-#define LOGGER_LOG_SYSTEM	"log/system"
++#define LOGGER_LOG_MAIN		"alog/main"
++#define LOGGER_LOG_RADIO	"alog/radio"
++#define LOGGER_LOG_EVENTS	"alog/events"
++#define LOGGER_LOG_SYSTEM	"alog/system"
+ 
+ #define LOG_BUF_SIZE 1024
+ 
+@@ -69,7 +69,7 @@ static int log_fds[(int)LOG_ID_MAX] = {
+ 
+ /*
+  * This is used by the C++ code to decide if it should write logs through
+- * the C code.  Basically, if /dev/log/... is available, we're running in
++ * the C code.  Basically, if /dev/alog/... is available, we're running in
+  * the simulator rather than a desktop tool and want to use the device.
+  */
+ static enum {
+--- /dev/null
++++ android-tools-5.1.1r36+git20160322/core/ubuntu/selinux/android.h
+@@ -0,0 +1,11 @@
++#ifndef _SELINUX_ANDROID_H_
++#define _SELINUX_ANDROID_H_
++
++#include <unistd.h>
++
++/**
++ * This is just stub header for missing functions
++ */
++int selinux_android_restorecon(const char *file, unsigned int flags);
++
++#endif
+--- /dev/null
++++ android-tools-5.1.1r36+git20160322/core/ubuntu/selinux_stub.c
+@@ -0,0 +1,48 @@
++/*
++ * Copyright © 2012 Canonical Ltd.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License version 3 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ * Authored by: Thomas Voß <thomas.voss@canonical.com>
++ */
++
++#include <selinux/selinux.h>
++
++// Ubuntu does not use selinux, stub here functions we do not need
++
++/**
++ * is selinux enabled
++ * stub implementation
++ */
++int is_selinux_enabled()
++{
++    return 0;
++}
++
++/**
++ * selinux restorecon
++ * stub implementation
++ */
++int selinux_android_restorecon(const char * file, unsigned int flags)
++{
++    return 0;
++}
++
++/**
++ * Set the current security context to con.
++ * stub implementation
++ */
++int setcon(const char * con)
++ {
++     return 0;
++ }
+--- /dev/null
++++ android-tools-5.1.1r36+git20160322/core/ubuntu/ubuntu_sockets.c
+@@ -0,0 +1,81 @@
++/*
++ * Copyright © 2012 Canonical Ltd.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License version 3 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ * Authored by: Thomas Voß <thomas.voss@canonical.com>
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include <resolv.h>
++#include <cutils/list.h>
++#include <cutils/sockets.h>
++#include <systemd/sd-daemon.h>
++#include <sys/un.h>
++#include <stdlib.h>
++
++#include "sysdeps.h"
++#include "adb_trace.h"
++
++#include "ubuntu_sockets.h"
++
++#define TRACE_TAG TRACE_AUTH
++
++/**
++ * Create android socket
++ */
++int ubuntu_create_android_control_socket(const char *name, int type, mode_t perm, uid_t uid, gid_t gid) {
++    int fd, n;
++    D("ubuntu_get_android_control_socket<<<\n");
++    n = sd_listen_fds(0);
++    if (n > 1) {
++        D("Too many file descriptors received.\n");
++        return -1;
++    } else if (n == 1) {
++        fd = SD_LISTEN_FDS_START + 0;
++        D("Socket already exists: fd=%d\n", fd);
++    } else {
++        union {
++                struct sockaddr sa;
++                struct sockaddr_un un;
++        } sa;
++
++        fd = socket(AF_UNIX, SOCK_STREAM, 0);
++        if (fd < 0) {
++            D("socket(): %m\n", stderr);
++            return -1;
++        }
++
++        memset(&sa, 0, sizeof(sa));
++        sa.un.sun_family = AF_UNIX;
++        snprintf(sa.un.sun_path, sizeof(sa.un.sun_path), ANDROID_SOCKET_DIR"/%s", name);
++
++        if (bind(fd, &sa.sa, sizeof(sa)) < 0) {
++                D("bind(): %m\n", stderr);
++                return -1;
++        }
++
++        chown(sa.un.sun_path, uid, gid);
++        chmod(sa.un.sun_path, perm);
++        char key[64] = ANDROID_SOCKET_ENV_PREFIX;
++        char val[64];
++
++        strncpy(key + sizeof(ANDROID_SOCKET_ENV_PREFIX) - 1,
++                name,
++                sizeof(key) - sizeof(ANDROID_SOCKET_ENV_PREFIX));
++        snprintf(val, sizeof(val), "%d", fd);
++        setenv(key, val, 1);
++    }
++    return fd;
++}
+--- /dev/null
++++ android-tools-5.1.1r36+git20160322/core/ubuntu/ubuntu_sockets.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright © 2012 Canonical Ltd.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License version 3 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ * Authored by: Thomas Voß <thomas.voss@canonical.com>
++ */
++
++#ifndef _UBUNTU_SOCKETS_H_
++#define _UBUNTU_SOCKETS_H_
++
++/**
++ * Creates android socket - creates a Unix domain socket in ANDROID_SOCKET_DIR
++ * ("/dev/socket")
++ * We communicate the file descriptor's value via the environment
++ * variable ANDROID_SOCKET_ENV_PREFIX<name> ("ANDROID_SOCKET_foo").
++ */
++int ubuntu_create_android_control_socket(const char *name, int type, mode_t perm, uid_t uid, gid_t gid);
++
++#endif
+--- android-tools-5.1.1r36+git20160322.orig/extras/ext4_utils/make_ext4fs.c
++++ android-tools-5.1.1r36+git20160322/extras/ext4_utils/make_ext4fs.c
+@@ -189,7 +189,7 @@ static u32 build_directory_structure(con
+ 		uint64_t capabilities;
+ 		if (fs_config_func != NULL) {
+ #ifdef ANDROID
+-			unsigned int mode = 0;
++			unsigned int mode = 0777 & stat.st_mode;
+ 			unsigned int uid = 0;
+ 			unsigned int gid = 0;
+ 			int dir = S_ISDIR(stat.st_mode);
+--- android-tools-5.1.1r36+git20160322.orig/extras/ext4_utils/make_ext4fs_main.c
++++ android-tools-5.1.1r36+git20160322/extras/ext4_utils/make_ext4fs_main.c
+@@ -29,6 +29,10 @@
+ #include <private/android_filesystem_config.h>
+ #endif
+ 
++#ifdef ANDROID
++#include <private/ubuntu_filesystem_config.h>
++#endif
++
+ #ifndef USE_MINGW
+ #include <selinux/selinux.h>
+ #include <selinux/label.h>
+@@ -53,6 +57,7 @@ static void usage(char *path)
+ 	fprintf(stderr, "%s [ -l <len> ] [ -j <journal size> ] [ -b <block_size> ]\n", basename(path));
+ 	fprintf(stderr, "    [ -g <blocks per group> ] [ -i <inodes> ] [ -I <inode size> ]\n");
+ 	fprintf(stderr, "    [ -L <label> ] [ -f ] [ -a <android mountpoint> ]\n");
++	fprintf(stderr, "    [ -u <ubuntu mountpoint> ] [ -U <ubuntu fs content> ]\n");
+ 	fprintf(stderr, "    [ -S file_contexts ] [ -C fs_config ] [ -T timestamp ]\n");
+ 	fprintf(stderr, "    [ -z | -s ] [ -w ] [ -c ] [ -J ] [ -v ] [ -B <block_list_file> ]\n");
+ 	fprintf(stderr, "    <filename> [<directory>]\n");
+@@ -64,6 +69,7 @@ int main(int argc, char **argv)
+ 	const char *filename = NULL;
+ 	const char *directory = NULL;
+ 	char *mountpoint = NULL;
++	char *fscontent = NULL;
+ 	fs_config_func_t fs_config_func = NULL;
+ 	const char *fs_config_file = NULL;
+ 	int gzip = 0;
+@@ -80,7 +86,7 @@ int main(int argc, char **argv)
+ 	struct selinux_opt seopts[] = { { SELABEL_OPT_PATH, "" } };
+ #endif
+ 
+-	while ((opt = getopt(argc, argv, "l:j:b:g:i:I:L:a:S:T:C:B:fwzJsctv")) != -1) {
++	while ((opt = getopt(argc, argv, "l:j:b:g:i:I:L:a:S:u:U:T:C:B:fwzJsctv")) != -1) {
+ 		switch (opt) {
+ 		case 'l':
+ 			info.len = parse_num(optarg);
+@@ -115,6 +121,26 @@ int main(int argc, char **argv)
+ 			exit(EXIT_FAILURE);
+ #endif
+ 			break;
++		case 'u':
++#ifdef ANDROID
++			fs_config_func = ubuntu_fs_config;
++			mountpoint = optarg;
++#else
++			fprintf(stderr, "can't set ubuntu permissions - built without ubuntu support\n");
++			usage(argv[0]);
++			exit(EXIT_FAILURE);
++#endif
++			break;
++		case 'U':
++#ifdef ANDROID
++			fs_config_func = ubuntu_fs_config;
++			ubuntu_set_fs_content(optarg);
++#else
++			fprintf(stderr, "can't set ubuntu fs content - built without ubuntu support\n");
++			usage(argv[0]);
++			exit(EXIT_FAILURE);
++#endif
++			break;
+ 		case 'w':
+ 			wipe = 1;
+ 			break;
+@@ -176,14 +202,14 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ #endif
+-
+-	if (fs_config_file) {
++	if (fs_config_file && !fs_config_func) {
+ 		if (load_canned_fs_config(fs_config_file) < 0) {
+ 			fprintf(stderr, "failed to load %s\n", fs_config_file);
+ 			exit(EXIT_FAILURE);
+ 		}
++
+ 		fs_config_func = canned_fs_config;
+-	} else if (mountpoint) {
++	} else if (mountpoint && !fs_config_func) {
+ 		fs_config_func = fs_config;
+ 	}
+ 
+--- /dev/null
++++ android-tools-5.1.1r36+git20160322/extras/ext4_utils/mkubuntuimg.sh
+@@ -0,0 +1,88 @@
++#!/bin/bash -x
++# Copyright 2014 Canonical Ltd.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# To call this script, make sure make_ext4fs is somewhere in PATH
++
++function usage() {
++cat<<EOT
++Usage:
++mkubuntuimg.sh [-s] [-i <inodes>] SRC_DIR OUTPUT_FILE EXT_VARIANT MOUNT_POINT SIZE [FS_CONTENT]
++EOT
++}
++
++echo "in mkubuntuimg.sh PATH=$PATH"
++ENABLE_SPARSE_IMAGE=
++if [ "$1" = "-s" ]; then
++  ENABLE_SPARSE_IMAGE="-s"
++  shift
++fi
++
++INODES=
++if [ "$1" = "-i" ]; then
++  INODES="-i $2"
++  shift 2
++fi
++
++if [ $# -ne 5 -a $# -ne 6 ]; then
++  usage
++  exit 1
++fi
++
++SRC_DIR=$1
++if [ ! -d $SRC_DIR ]; then
++  echo "Can not find directory $SRC_DIR!"
++  exit 2
++fi
++
++OUTPUT_FILE=$2
++EXT_VARIANT=$3
++MOUNT_POINT=$4
++SIZE=$5
++CONTENT=$6
++LABEL=""
++
++case $EXT_VARIANT in
++  ext4) ;;
++  *) echo "Only ext4 is supported!"; exit 3 ;;
++esac
++
++if [ -z $MOUNT_POINT ]; then
++  echo "Mount point is required"
++  exit 2
++fi
++
++case $MOUNT_POINT in
++  "/")
++    LABEL="-L rootfs"
++    ;;
++  "custom")
++    LABEL="-L custom"
++    ;;
++esac
++
++if [ -z $SIZE ]; then
++  echo "Need size of filesystem"
++  exit 2
++fi
++
++if [ -f $CONTENT ]; then
++    FS_CONTENT="-U $CONTENT"
++fi
++MAKE_EXT4FS_CMD="make_ext4fs $ENABLE_SPARSE_IMAGE $INODES -l $SIZE $LABEL -u $MOUNT_POINT $FS_CONTENT $OUTPUT_FILE $SRC_DIR"
++echo $MAKE_EXT4FS_CMD
++$MAKE_EXT4FS_CMD
++if [ $? -ne 0 ]; then
++  exit 4
++fi
+--- android-tools-5.1.1r36+git20160322.orig/extras/ext4_utils/mkuserimg.sh
++++ android-tools-5.1.1r36+git20160322/extras/ext4_utils/mkuserimg.sh
+@@ -62,6 +62,7 @@ if [[ "$1" == "-B" ]]; then
+ fi
+ 
+ FC=$1
++LABEL=""
+ 
+ case $EXT_VARIANT in
+   ext4) ;;
+@@ -73,6 +74,18 @@ if [ -z $MOUNT_POINT ]; then
+   exit 2
+ fi
+ 
++case $MOUNT_POINT in
++  "system")
++    LABEL="-L SYSTEM"
++    ;;
++  "data")
++    LABEL="-L USERDATA"
++    ;;
++  "cache")
++    LABEL="-L CACHE"
++    ;;
++esac
++
+ if [ -z $SIZE ]; then
+   echo "Need size of filesystem"
+   exit 2
+@@ -89,7 +102,7 @@ if [ -n "$BLOCK_LIST" ]; then
+   OPT="$OPT -B $BLOCK_LIST"
+ fi
+ 
+-MAKE_EXT4FS_CMD="make_ext4fs $ENABLE_SPARSE_IMAGE -T $TIMESTAMP $OPT -l $SIZE $JOURNAL_FLAGS -a $MOUNT_POINT $OUTPUT_FILE $SRC_DIR"
++MAKE_EXT4FS_CMD="make_ext4fs $ENABLE_SPARSE_IMAGE -T $TIMESTAMP $OPT -l $SIZE $JOURNAL_FLAGS -a $MOUNT_POINT $LABEL $OUTPUT_FILE $SRC_DIR"
+ echo $MAKE_EXT4FS_CMD
+ $MAKE_EXT4FS_CMD
+ if [ $? -ne 0 ]; then
+--- android-tools-5.1.1r36+git20160322.orig/extras/f2fs_utils/f2fs_utils.c
++++ android-tools-5.1.1r36+git20160322/extras/f2fs_utils/f2fs_utils.c
+@@ -53,7 +53,7 @@ static void reset_f2fs_info() {
+ 	config.fd = -1;
+ 	if (f2fs_sparse_file) {
+ 		sparse_file_destroy(f2fs_sparse_file);
+-		f2fs_sparse_file = NULL;
++		f2fs_sparse_file = 0;
+ 	}
+ }
+ 
+@@ -73,6 +73,6 @@ int make_f2fs_sparse_fd(int fd, long lon
+ 	sparse_file_write(f2fs_sparse_file, fd, /*gzip*/0, /*sparse*/1, /*crc*/0);
+ 	sparse_file_destroy(f2fs_sparse_file);
+ 	flush_sparse_buffs();
+-	f2fs_sparse_file = NULL;
++	f2fs_sparse_file = 0;
+ 	return 0;
+ }
