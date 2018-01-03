@@ -1,5 +1,7 @@
 # Makefile for adb; based on core/adb/Android.mk
 
+CC := musl-gcc
+
 VPATH+= ../adb
 SRCS+= adb.c
 SRCS+= console.c
@@ -34,8 +36,9 @@ CPPFLAGS+= -I.
 CPPFLAGS+= -I../adb
 CPPFLAGS+= -I../include
 CPPFLAGS+= -I../../../external/zlib
+CPPFLAGS+= -I../../musl-ssl/include
 
-LIBS+= -lpthread -lz -lcrypto -ldl -static -static-libgcc
+LIBS+= -lpthread -L../../musl-ssl/lib -lcrypto -ldl -static -static-libgcc
 
 OBJS= $(SRCS:.c=.o)
 

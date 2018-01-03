@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#if 0
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -713,3 +714,23 @@ void usb_init()
         fatal_errno("cannot create input thread");
     }
 }
+#else
+
+void usb_init()
+{}
+
+void usb_cleanup()
+{}
+
+int usb_read(void *h, void *_data, int len)
+{}
+
+int usb_write(void *h, const void *_data, int len)
+{}
+
+int usb_close(void *h)
+{}
+
+void usb_kick(void *h)
+{}
+#endif
