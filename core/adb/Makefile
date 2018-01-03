@@ -38,7 +38,7 @@ CPPFLAGS+= -I../include
 CPPFLAGS+= -I../../../external/zlib
 CPPFLAGS+= -I../../musl-ssl/include
 
-LIBS+= -lpthread -L../../musl-ssl/lib -lcrypto -ldl -static -static-libgcc
+LIBS+= -L../../musl-ssl/lib -lcrypto -static
 
 OBJS= $(SRCS:.c=.o)
 
