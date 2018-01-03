@@ -1370,7 +1370,7 @@ int adb_main(int is_daemon, int server_port)
     struct passwd *pw = getpwuid(UBUNTU_PHABLET);
     initgroups(pw->pw_name, pw->pw_gid);
 
-    /* don't listen on a port (default 5037) if running in secure mode */
+    /* don't listen on a port (default 8837) if running in secure mode */
     /* don't run as root if we are running in secure mode */
     if (should_drop_privileges()) {
         // do not drop capabilities, we are already almost ready, just set CAP_DAC_OVERRIDE

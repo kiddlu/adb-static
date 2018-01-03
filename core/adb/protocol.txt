@@ -256,7 +256,7 @@ multiple WRITEs may be sent without requiring individual READY acks.
 
 --- smartsockets -------------------------------------------------------
 
-Port 5037 is used for smart sockets which allow a client on the host
+Port 8837 is used for smart sockets which allow a client on the host
 side to request access to a service in the host adb daemon or in the
 remote (device) daemon.  The service is requested by ascii name,
 preceeded by a 4 digit hex length.  Upon successful connection an

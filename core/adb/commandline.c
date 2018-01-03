@@ -99,7 +99,7 @@ void help()
         "                                 environment variable is used, which must\n"
         "                                 be an absolute path.\n"
         " -H                            - Name of adb server host (default: localhost)\n"
-        " -P                            - Port of adb server (default: 5037)\n"
+        " -P                            - Port of adb server (default: 8837)\n"
         " devices [-l]                  - list all connected devices\n"
         "                                 ('-l' will also list device qualifiers)\n"
         " connect <host>[:<port>]       - connect to a device via TCP/IP\n"

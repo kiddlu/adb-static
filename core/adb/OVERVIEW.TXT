@@ -79,7 +79,7 @@ II. Protocol details:
   1. Client <-> Server protocol:
 
     This details the protocol used between ADB clients and the ADB
-    server itself. The ADB server listens on TCP:localhost:5037.
+    server itself. The ADB server listens on TCP:localhost:8837.
 
     A client sends a request using the following format:
 
@@ -89,7 +89,7 @@ II. Protocol details:
     For example, to query the ADB server for its internal version number,
     the client will do the following:
 
-        1. Connect to tcp:localhost:5037
+        1. Connect to tcp:localhost:8837
         2. Send the string "000Chost:version" to the corresponding socket
 
     The 'host:' prefix is used to indicate that the request is addressed

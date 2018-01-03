@@ -60,7 +60,7 @@ int  main( void )
 
     memset( &server, 0, sizeof(server) );
     server.sin_family      = AF_INET;
-    server.sin_port        = htons(5037);
+    server.sin_port        = htons(8837);
     server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     s = socket( PF_INET, SOCK_STREAM, 0 );
