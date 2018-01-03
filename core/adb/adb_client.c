@@ -226,14 +226,14 @@ int adb_connect(const char *service)
         fprintf(stderr,"** Cannot start server on remote host\n");
         return fd;
     } else if(fd == -2) {
-        fprintf(stdout,"* daemon not running. starting it now on port %d *\n",
-                __adb_server_port);
+        //fprintf(stdout,"* daemon not running. starting it now on port %d *\n",
+        //        __adb_server_port);
     start_server:
         if(launch_server(__adb_server_port)) {
             fprintf(stderr,"* failed to start daemon *\n");
             return -1;
         } else {
-            fprintf(stdout,"* daemon started successfully *\n");
+            //fprintf(stdout,"* daemon started successfully *\n");
         }
         /* give the server some time to start properly and detect devices */
         adb_sleep_ms(3000);
